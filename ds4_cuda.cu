@@ -13719,10 +13719,42 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
     }
 }
 
+/* Sort one streaming candidate tile in shared memory without relying on
+ * CUB's 512-thread radix rank/exchange path.  CUDA 13.0 on sm_121 has
+ * produced data-dependent out-of-range shared-memory ranks in that path. */
+template <uint32_t SORT_N>
+__device__ __forceinline__ static void indexer_topk_stream_sort_desc(
+        uint64_t *keys, uint64_t *scratch, uint32_t tid) {
+    uint64_t *src = keys;
+    uint64_t *dst = scratch;
+    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
+        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+            __syncthreads();
+            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
+                const uint32_t other = i ^ j;
+                const uint64_t a = src[i];
+                const uint64_t b = src[other];
+                const bool lower = i < other;
+                const bool descending = (i & k) == 0u;
+                const bool take_max = descending == lower;
+                dst[i] = take_max ? (a > b ? a : b) : (a < b ? a : b);
+            }
+            __syncthreads();
+            uint64_t *tmp = src;
+            src = dst;
+            dst = tmp;
+        }
+    }
+    if (src != keys) {
+        for (uint32_t i = tid; i < SORT_N; i += blockDim.x) keys[i] = src[i];
+        __syncthreads();
+    }
+}
+
 /* Exact streaming top-512 for wide prefill rows. The threshold is the
  * 512th-best key seen so far, so it can only discard candidates that cannot
  * belong to the final top set. Packing supplies the same value/index total
- * order as the existing bitonic and CUB tiers. */
+ * order as the existing specialized and chunked tiers. */
 __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
         uint32_t *selected,
         const float *scores,
@@ -13732,9 +13764,8 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
     constexpr uint32_t STREAM_THREADS = 512u;
     constexpr uint32_t STREAM_ITEMS = 4u;
     constexpr uint32_t STREAM_CAP = STREAM_THREADS * STREAM_ITEMS;
-    using StreamSort = cub::BlockRadixSort<uint64_t, STREAM_THREADS, STREAM_ITEMS>;
     __shared__ uint64_t buf[STREAM_CAP];
-    __shared__ typename StreamSort::TempStorage sort_tmp;
+    __shared__ uint64_t sort_scratch[STREAM_CAP];
     __shared__ uint32_t s_cnt;
     __shared__ uint64_t s_thr;
 
@@ -13752,6 +13783,23 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
         (uint32_t)(((uint64_t)(t + 1u) * 0x9E3779B9u) % n_comp);
     const uint32_t tile = blockDim.x;
     for (uint32_t base = 0; base < n_comp; base += tile) {
+        /* Compact on a block-uniform schedule.  Three 512-key tiles plus the
+         * retained 512 keys exactly fit STREAM_CAP, so the following append
+         * is always bounded without a shared-data-dependent collective. */
+        if (base != 0u && base % (3u * tile) == 0u) {
+            const uint32_t cnt = s_cnt;
+            for (uint32_t j = tid + cnt; j < STREAM_CAP; j += blockDim.x) {
+                buf[j] = 0u;
+            }
+            __syncthreads();
+            indexer_topk_stream_sort_desc<STREAM_CAP>(buf, sort_scratch, tid);
+            if (tid == 0u) {
+                s_cnt = cnt < top_k ? cnt : top_k;
+                s_thr = cnt < top_k ? 0u : buf[top_k - 1u];
+            }
+            __syncthreads();
+        }
+
         const uint64_t thr = s_thr;
         const uint32_t i = base + tid;
         uint64_t key = 0u;
@@ -13772,47 +13820,18 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
             buf[pos + rank] = key;
         }
         __syncthreads();
-
-        if (s_cnt > STREAM_CAP - tile) {
-            const uint32_t cnt = s_cnt;
-            uint64_t keys[STREAM_ITEMS];
-#pragma unroll
-            for (uint32_t k = 0; k < STREAM_ITEMS; k++) {
-                const uint32_t j = tid * STREAM_ITEMS + k;
-                keys[k] = j < cnt ? buf[j] : 0u;
-            }
-            __syncthreads();
-            StreamSort(sort_tmp).SortDescending(keys);
-            __syncthreads();
-            if (tid < top_k / STREAM_ITEMS) {
-#pragma unroll
-                for (uint32_t k = 0; k < STREAM_ITEMS; k++) {
-                    buf[tid * STREAM_ITEMS + k] = keys[k];
-                }
-            }
-            if (tid == top_k / STREAM_ITEMS - 1u) {
-                s_thr = keys[STREAM_ITEMS - 1u];
-            }
-            if (tid == 0u) s_cnt = top_k;
-            __syncthreads();
-        }
     }
 
-    const uint32_t cnt = s_cnt;
-    uint64_t keys[STREAM_ITEMS];
-#pragma unroll
-    for (uint32_t k = 0; k < STREAM_ITEMS; k++) {
-        const uint32_t i = tid * STREAM_ITEMS + k;
-        keys[k] = i < cnt ? buf[i] : 0u;
+    for (uint32_t i = tid + s_cnt; i < STREAM_CAP; i += blockDim.x) {
+        buf[i] = 0u;
     }
     __syncthreads();
-    StreamSort(sort_tmp).SortDescending(keys);
-    __syncthreads();
+    indexer_topk_stream_sort_desc<STREAM_CAP>(buf, sort_scratch, tid);
     if (tid < top_k / STREAM_ITEMS) {
 #pragma unroll
         for (uint32_t k = 0; k < STREAM_ITEMS; k++) {
             selected[(uint64_t)t * top_k + tid * STREAM_ITEMS + k] =
-                0xffffffffu - (uint32_t)keys[k];
+                0xffffffffu - (uint32_t)buf[tid * STREAM_ITEMS + k];
         }
     }
 }

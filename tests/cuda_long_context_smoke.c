@@ -1,5 +1,6 @@
 #include "ds4_gpu.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,23 +20,59 @@ static double getenv_seconds(const char *name, double fallback) {
     return end != s && v > 0.0 ? v : fallback;
 }
 
-static int check_large_topk(void) {
-    const uint32_t n_comp = 32768;
-    const uint32_t n_tokens = 32;
+typedef struct {
+    float score;
+    uint32_t index;
+} topk_ref_entry;
+
+static int topk_ref_cmp(const void *ap, const void *bp) {
+    const topk_ref_entry *a = (const topk_ref_entry *)ap;
+    const topk_ref_entry *b = (const topk_ref_entry *)bp;
+    if (a->score > b->score) return -1;
+    if (a->score < b->score) return 1;
+    return a->index < b->index ? -1 : (a->index > b->index ? 1 : 0);
+}
+
+static uint32_t topk_test_hash(uint32_t x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    return x ^ (x >> 16u);
+}
+
+static int check_large_topk_case(uint32_t n_comp) {
+    const uint32_t n_tokens = 128;
     const uint32_t top_k = 512;
     const uint64_t score_count = (uint64_t)n_comp * n_tokens;
     float *scores_host = (float *)malloc((size_t)score_count * sizeof(float));
-    uint32_t *selected_host = (uint32_t *)malloc((size_t)n_tokens * top_k * sizeof(uint32_t));
-    if (!scores_host || !selected_host) return 1;
+    uint32_t *selected_host =
+        (uint32_t *)malloc((size_t)n_tokens * top_k * sizeof(uint32_t));
+    topk_ref_entry *reference =
+        (topk_ref_entry *)malloc((size_t)n_comp * sizeof(topk_ref_entry));
+    if (!scores_host || !selected_host || !reference) return 1;
 
-    for (uint32_t t = 0; t < n_tokens; t++) {
+    for (uint32_t i = 0; i < n_comp; i++) {
+        const uint32_t h = topk_test_hash(i);
+        const float score = i % 997u == 0u ? INFINITY
+            : (i % 89u == 0u ? -INFINITY
+                              : (float)((int32_t)(h % 4096u) - 2048));
+        reference[i].score = score;
+        reference[i].index = i;
+    }
+    qsort(reference, n_comp, sizeof(reference[0]), topk_ref_cmp);
+    for (uint32_t i = 0; i < n_comp; i++) {
+        scores_host[reference[i].index] = reference[i].score;
+    }
+    for (uint32_t t = 1; t < n_tokens; t++) {
         for (uint32_t i = 0; i < n_comp; i++) {
-            scores_host[(uint64_t)t * n_comp + i] = (float)i;
+            scores_host[(uint64_t)t * n_comp + i] = scores_host[i];
         }
     }
 
     ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(score_count * sizeof(float));
-    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)n_tokens * top_k * sizeof(uint32_t));
+    ds4_gpu_tensor *selected =
+        ds4_gpu_tensor_alloc((uint64_t)n_tokens * top_k * sizeof(uint32_t));
     int rc = 1;
     double elapsed = 0.0;
     if (scores && selected &&
@@ -43,7 +80,6 @@ static int check_large_topk(void) {
         /* Exclude one-time CUDA module/kernel setup from the throughput guard. */
         if (!ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens, top_k) ||
             !ds4_gpu_synchronize()) {
-            rc = 1;
             goto cleanup;
         }
         const double t0 = monotonic_seconds();
@@ -57,11 +93,12 @@ static int check_large_topk(void) {
     if (rc == 0) {
         for (uint32_t t = 0; t < n_tokens && rc == 0; t++) {
             for (uint32_t i = 0; i < top_k; i++) {
-                const uint32_t expected = n_comp - 1u - i;
+                const uint32_t expected = reference[i].index;
                 const uint32_t got = selected_host[(uint64_t)t * top_k + i];
                 if (got != expected) {
-                    fprintf(stderr, "top-k mismatch token=%u rank=%u got=%u expected=%u\n",
-                            t, i, got, expected);
+                    fprintf(stderr,
+                            "top-k mismatch n_comp=%u token=%u rank=%u got=%u expected=%u\n",
+                            n_comp, t, i, got, expected);
                     rc = 1;
                     break;
                 }
@@ -81,9 +118,18 @@ static int check_large_topk(void) {
 cleanup:
     ds4_gpu_tensor_free(selected);
     ds4_gpu_tensor_free(scores);
+    free(reference);
     free(selected_host);
     free(scores_host);
     return rc;
+}
+
+static int check_large_topk(void) {
+    const uint32_t cases[] = {8193u, 17021u, 32768u, 59082u};
+    for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (check_large_topk_case(cases[i]) != 0) return 1;
+    }
+    return 0;
 }
 
 static int check_decode_attention_overflow_path(void) {
@@ -159,7 +205,8 @@ static int check_decode_attention_overflow_path(void) {
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
-    if (check_decode_attention_overflow_path() != 0) rc = 1;
+    if (getenv("DS4_CUDA_TOPK_ONLY") == NULL &&
+        check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;
